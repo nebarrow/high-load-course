@@ -2,6 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -21,6 +23,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    meterRegistry: MeterRegistry,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -45,6 +48,14 @@ class PaymentExternalSystemAdapterImpl(
 
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
+    private val outgoingRequests = Counter.builder("shop.provider.requests")
+        .tag("account", accountName)
+        .register(meterRegistry)
+
+    private val droppedPayments = Counter.builder("shop.payments.dropped")
+        .tag("account", accountName)
+        .register(meterRegistry)
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
@@ -60,7 +71,16 @@ class PaymentExternalSystemAdapterImpl(
 
         ongoingWindow.acquire()
         try {
+            if (deadline - now() < requestAverageProcessingTime.toMillis()) {
+                droppedPayments.increment()
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Deadline cannot be met.")
+                }
+                return
+            }
+
             rateLimiter.tickBlocking()
+            outgoingRequests.increment()
 
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
