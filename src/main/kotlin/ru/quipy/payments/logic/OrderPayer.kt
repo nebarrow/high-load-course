@@ -1,5 +1,6 @@
 package ru.quipy.payments.logic
 
+import io.micrometer.core.instrument.MeterRegistry
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -26,6 +27,11 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
+    @Autowired
+    private lateinit var meterRegistry: MeterRegistry
+
+    private val incomingPayments by lazy { meterRegistry.counter("shop.payments.incoming") }
+
     private val paymentExecutor = ThreadPoolExecutor(
         16,
         16,
@@ -38,6 +44,7 @@ class OrderPayer {
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
+        incomingPayments.increment()
         paymentExecutor.submit {
             val createdEvent = paymentESService.create {
                 it.create(
