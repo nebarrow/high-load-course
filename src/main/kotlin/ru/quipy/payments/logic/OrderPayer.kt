@@ -45,7 +45,7 @@ class OrderPayer {
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
         incomingPayments.increment()
-        paymentService.tryReserve(deadline)?.let { retryAfter -> throw TooManyRequestsException(retryAfter) }
+        paymentService.tryAccept(deadline)?.let { retryAfter -> throw TooManyRequestsException(retryAfter) }
         paymentExecutor.submit {
             val createdEvent = try {
                 paymentESService.create {
@@ -56,7 +56,7 @@ class OrderPayer {
                     )
                 }
             } catch (e: Exception) {
-                paymentService.releaseReservation()
+                paymentService.releaseAccepted()
                 throw e
             }
             logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
