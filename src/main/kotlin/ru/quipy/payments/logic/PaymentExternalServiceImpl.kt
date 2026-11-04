@@ -8,6 +8,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -15,7 +16,8 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 
 // Advice: always treat time as a Duration
@@ -33,26 +35,19 @@ class PaymentExternalSystemAdapterImpl(
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
 
-        const val PROCESSING_TIME = 2
-        const val RETRY_AFTER = 50L
+        const val PROCESSING_TIME = 2.0
+        const val INBOUND_RATE_FACTOR = 0.9
+        const val RETRY_AFTER_MILLIS = 100L
     }
 
-    override fun tryReserve(deadline: Long): Long? {
-        val now = now()
-        val maxPending = (deadline - now - processingBudgetMillis) * rateLimitPerSec / 1000
-        while (true) {
-            val pending = pendingPayments.get()
-            if (pending >= maxPending) {
-                return now + RETRY_AFTER
-            }
-            if (pendingPayments.compareAndSet(pending, pending + 1)) {
-                return null
-            }
-        }
+    override fun tryAccept(deadline: Long): Long? {
+        val waitSeconds = (deadline - now() - processingBudgetMillis) / 1000
+        if (waitSeconds >= 0 && inboundRateLimiter.tryAcquire(inboundRate * (waitSeconds + 1))) return null
+        return now() + RETRY_AFTER_MILLIS
     }
 
-    override fun releaseReservation() {
-        pendingPayments.decrementAndGet()
+    override fun releaseAccepted() {
+        inboundRateLimiter.leak()
     }
 
     private val serviceName = properties.serviceName
@@ -70,7 +65,11 @@ class PaymentExternalSystemAdapterImpl(
 
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
-    private val pendingPayments = AtomicInteger(0)
+    private val outgoingQueue = ReentrantLock(true)
+
+    private val inboundRate = rateLimitPerSec * INBOUND_RATE_FACTOR
+
+    private val inboundRateLimiter = LeakingBucketRateLimiter()
 
     private val processingBudgetMillis = (requestAverageProcessingTime.toMillis() * PROCESSING_TIME).toLong()
 
@@ -87,17 +86,15 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
-        // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-        // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-        }
-
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-
-        var reserved = true
-        ongoingWindow.acquire()
         try {
+            // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
+            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
+
+            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+
             if (deadline - now() < requestAverageProcessingTime.toMillis()) {
                 droppedPayments.increment()
                 paymentESService.update(paymentId) {
@@ -106,9 +103,13 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
-            rateLimiter.tickBlocking()
-            releaseReservation()
-            reserved = false
+            outgoingQueue.withLock { rateLimiter.tickBlocking() }
+        } finally {
+            inboundRateLimiter.leak()
+        }
+
+        ongoingWindow.acquire()
+        try {
             outgoingRequests.increment()
 
             val request = Request.Builder().run {
@@ -150,7 +151,6 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } finally {
-            if (reserved) releaseReservation()
             ongoingWindow.release()
         }
     }

@@ -9,9 +9,9 @@ interface PaymentService {
      */
     fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
 
-    fun tryReserve(deadline: Long): Long?
+    fun tryAccept(deadline: Long): Long?
 
-    fun releaseReservation()
+    fun releaseAccepted()
 }
 
 /**
@@ -23,9 +23,9 @@ interface PaymentService {
 interface PaymentExternalSystemAdapter {
     fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
 
-    fun tryReserve(deadline: Long): Long?
+    fun tryAccept(deadline: Long): Long?
 
-    fun releaseReservation()
+    fun releaseAccepted()
 
     fun name(): String
 

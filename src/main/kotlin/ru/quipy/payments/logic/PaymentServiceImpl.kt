@@ -18,7 +18,7 @@ class PaymentSystemImpl(
         }
     }
 
-    override fun tryReserve(deadline: Long): Long? = paymentAccounts.first().tryReserve(deadline)
+    override fun tryAccept(deadline: Long): Long? = paymentAccounts.first().tryAccept(deadline)
 
-    override fun releaseReservation() = paymentAccounts.first().releaseReservation()
+    override fun releaseAccepted() = paymentAccounts.first().releaseAccepted()
 }
