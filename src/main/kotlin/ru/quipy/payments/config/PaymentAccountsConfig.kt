@@ -5,6 +5,8 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.MeterRegistry
 import org.springframework.beans.factory.annotation.Value
+import org.springframework.boot.context.properties.ConfigurationProperties
+import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import ru.quipy.core.EventSourcingService
@@ -14,10 +16,12 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.time.Duration
 import java.util.*
 
 
 @Configuration
+@EnableConfigurationProperties(PaymentTimeoutProperties::class)
 class PaymentAccountsConfig {
     companion object {
         private val javaClient = HttpClient.newBuilder().build()
@@ -40,6 +44,7 @@ class PaymentAccountsConfig {
     fun accountAdapters(
         paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
         meterRegistry: MeterRegistry,
+        timeoutProperties: PaymentTimeoutProperties,
     ): List<PaymentExternalSystemAdapter> {
         val request = HttpRequest.newBuilder()
             .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
@@ -63,7 +68,13 @@ class PaymentAccountsConfig {
                     paymentProviderHostPort,
                     token,
                     meterRegistry,
+                    attemptTimeout = timeoutProperties.attemptTimeouts[it.accountName],
                 )
             }
     }
 }
+
+@ConfigurationProperties("payment")
+class PaymentTimeoutProperties(
+    val attemptTimeouts: Map<String, Duration> = emptyMap(),
+)
