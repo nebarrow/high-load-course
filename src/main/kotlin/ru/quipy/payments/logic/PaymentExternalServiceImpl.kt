@@ -31,6 +31,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentProviderHostPort: String,
     private val token: String,
     private val meterRegistry: MeterRegistry,
+    attemptTimeout: Duration? = null,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -66,6 +67,9 @@ class PaymentExternalSystemAdapterImpl(
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
+    private val attemptTimeoutMillis = attemptTimeout?.toMillis()?.also {
+        require(it > 0) { "Attempt timeout for $accountName must be at least 1 ms" }
+    }
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
@@ -185,7 +189,9 @@ class PaymentExternalSystemAdapterImpl(
 
             outgoingRequests.increment()
 
-            val providerTimeout = Duration.ofMillis(timeLeft)
+            val providerTimeout = Duration.ofMillis(minOf(timeLeft, attemptTimeoutMillis ?: timeLeft))
+            val clientTimeoutMillis = providerTimeout.toMillis() + CLIENT_TIMEOUT_MARGIN_MILLIS
+            val callTimeoutMillis = if (attemptTimeoutMillis == null) clientTimeoutMillis else minOf(timeLeft, clientTimeoutMillis)
 
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=$providerTimeout")
@@ -193,7 +199,7 @@ class PaymentExternalSystemAdapterImpl(
             }.build()
 
             val call = client.newCall(request)
-            call.timeout().timeout(timeLeft + CLIENT_TIMEOUT_MARGIN_MILLIS, TimeUnit.MILLISECONDS)
+            call.timeout().timeout(callTimeoutMillis, TimeUnit.MILLISECONDS)
 
             if (isRetry) retriedRequests.increment()
             val response = readProviderResponse(call)
