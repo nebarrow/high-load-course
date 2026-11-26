@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
+import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -28,7 +30,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-    meterRegistry: MeterRegistry,
+    private val meterRegistry: MeterRegistry,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -49,6 +51,8 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private class AttemptOutcome(val retryAfterMillis: Long?)
+
+    private class ProviderResponse(val code: Int, val body: String?, val retryAfter: String?)
 
     override fun tryAccept(deadline: Long): Long? {
         val waitSeconds = (deadline - now() - processingBudgetMillis) / 1000
@@ -92,8 +96,19 @@ class PaymentExternalSystemAdapterImpl(
         .register(meterRegistry)
 
     private val retriedRequests = Counter.builder("shop.provider.retries")
+        .description("Repeat payment calls started by the application")
         .tag("account", accountName)
         .register(meterRegistry)
+
+    private val attemptDuration = Timer.builder("shop.provider.attempt.duration")
+        .description("Duration of an individual HTTP call to the payment provider")
+        .tag("account", accountName)
+        .publishPercentileHistogram()
+        .withRegistry(meterRegistry)
+
+    private val responseDuration = attemptDuration.withTags("outcome", "response")
+    private val timeoutDuration = attemptDuration.withTags("outcome", "timeout")
+    private val ioErrorDuration = attemptDuration.withTags("outcome", "io_error")
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -129,7 +144,7 @@ class PaymentExternalSystemAdapterImpl(
                     accepted = false
                 }
 
-                val outcome = executeAttempt(paymentId, transactionId, amount, deadline)
+                val outcome = executeAttempt(paymentId, transactionId, amount, deadline, isRetry = attempt > 0)
                 attempt++
                 val retryAfter = outcome.retryAfterMillis ?: return
 
@@ -144,7 +159,6 @@ class PaymentExternalSystemAdapterImpl(
                     return
                 }
 
-                retriedRequests.increment()
                 Thread.sleep(delay)
             }
         } finally {
@@ -152,7 +166,13 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    private fun executeAttempt(paymentId: UUID, transactionId: UUID, amount: Int, deadline: Long): AttemptOutcome {
+    private fun executeAttempt(
+        paymentId: UUID,
+        transactionId: UUID,
+        amount: Int,
+        deadline: Long,
+        isRetry: Boolean,
+    ): AttemptOutcome {
         ongoingWindow.acquire()
         try {
             val timeLeft = deadline - now()
@@ -175,31 +195,31 @@ class PaymentExternalSystemAdapterImpl(
             val call = client.newCall(request)
             call.timeout().timeout(timeLeft + CLIENT_TIMEOUT_MARGIN_MILLIS, TimeUnit.MILLISECONDS)
 
-            call.execute().use { response ->
-                val rawBody = response.body?.string()
-                val body = try {
-                    mapper.readValue(rawBody, ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: $rawBody")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                }
+            if (isRetry) retriedRequests.increment()
+            val response = readProviderResponse(call)
+            val rawBody = response.body
+            val body = try {
+                mapper.readValue(rawBody, ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: $rawBody")
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            }
 
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                }
+            // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+            // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+            paymentESService.update(paymentId) {
+                it.logProcessing(body.result, now(), transactionId, reason = body.message)
+            }
 
-                if (body.result) return AttemptOutcome(null)
+            if (body.result) return AttemptOutcome(null)
 
-                return when {
-                    response.code == 200 -> AttemptOutcome(0)
-                    response.code == 429 -> AttemptOutcome(parseRetryAfterMillis(response.header("Retry-After")))
-                    response.code in RETRIABLE_CODES -> AttemptOutcome(0)
-                    else -> AttemptOutcome(null)
-                }
+            return when {
+                response.code == 200 -> AttemptOutcome(0)
+                response.code == 429 -> AttemptOutcome(parseRetryAfterMillis(response.retryAfter))
+                response.code in RETRIABLE_CODES -> AttemptOutcome(0)
+                else -> AttemptOutcome(null)
             }
         } catch (e: InterruptedIOException) {
             logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
@@ -222,6 +242,20 @@ class PaymentExternalSystemAdapterImpl(
         } finally {
             ongoingWindow.release()
         }
+    }
+
+    private fun readProviderResponse(call: Call): ProviderResponse {
+        val sample = Timer.start(meterRegistry)
+        val response = try {
+            call.execute().use {
+                ProviderResponse(it.code, it.body?.string(), it.header("Retry-After"))
+            }
+        } catch (e: IOException) {
+            sample.stop(if (e is InterruptedIOException) timeoutDuration else ioErrorDuration)
+            throw e
+        }
+        sample.stop(responseDuration)
+        return response
     }
 
     private fun parseRetryAfterMillis(header: String?): Long =

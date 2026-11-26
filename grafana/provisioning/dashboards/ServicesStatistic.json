@@ -2055,7 +2055,7 @@
             "h": 8,
             "w": 12,
             "x": 12,
-            "y": 108
+            "y": 116
           },
           "id": 43,
           "options": {
@@ -2091,6 +2091,122 @@
             }
           ],
           "title": "(Test system -> Online shop)  Average request latent time (before submit)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "description": "Repeat HTTP attempts started by the shop in the preceding minute, grouped by payment account.",
+          "fieldConfig": {
+            "defaults": {
+              "min": 0,
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 108
+          },
+          "id": 101,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+              },
+              "editorMode": "code",
+              "expr": "sum by (account) (increase(shop_provider_retries_total[1m]))",
+              "legendFormat": "{{account}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Payment provider retries per minute",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "description": "Latency percentiles for HTTP attempts by account, including timeouts and I/O errors. Timing covers the call through response body consumption.",
+          "fieldConfig": {
+            "defaults": {
+              "min": 0,
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 108
+          },
+          "id": 102,
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.5, sum by (le, account) (rate(shop_provider_attempt_duration_seconds_bucket[$__rate_interval])))",
+              "legendFormat": "p50 · {{account}}",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.85, sum by (le, account) (rate(shop_provider_attempt_duration_seconds_bucket[$__rate_interval])))",
+              "legendFormat": "p85 · {{account}}",
+              "range": true,
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "PBFA97CFB590B2093"
+              },
+              "editorMode": "code",
+              "expr": "histogram_quantile(0.95, sum by (le, account) (rate(shop_provider_attempt_duration_seconds_bucket[$__rate_interval])))",
+              "legendFormat": "p95 · {{account}}",
+              "range": true,
+              "refId": "C"
+            }
+          ],
+          "title": "Payment provider attempt duration",
           "type": "timeseries"
         }
       ],
